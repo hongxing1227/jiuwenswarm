@@ -42,7 +42,11 @@ from openjiuwen.core.runner import Runner
 from openjiuwen.core.session.checkpointer import CheckpointerFactory
 from openjiuwen.core.session.checkpointer.checkpointer import CheckpointerConfig
 from openjiuwen.core.session.checkpointer.persistence import PersistenceCheckpointerProvider
-from openjiuwen.core.single_agent import AgentCard, ReActAgentConfig
+from openjiuwen.core.single_agent import (
+    AgentCard,
+    ReActAgentConfig,
+    create_agent_session,
+)
 from openjiuwen.core.sys_operation import (
     SysOperation,
     SysOperationCard,
@@ -5366,8 +5370,6 @@ class JiuWenSwarmDeepAdapter:
         if self._instance is None:
             return
         try:
-            from openjiuwen.core.session.agent import create_agent_session
-
             session = create_agent_session(
                 session_id=session_id,
                 card=getattr(self._instance, "card", None),
@@ -7096,7 +7098,14 @@ class JiuWenSwarmDeepAdapter:
                     ids_to_cancel.append(todo.id)
 
             if ids_to_cancel:
-                await modify_tool._cancel_todos(ids_to_cancel, todos)
+                session = create_agent_session(
+                    session_id=session_id,
+                    card=getattr(self._instance, "card", None),
+                )
+                await modify_tool.invoke(
+                    {"action": "cancel", "ids": ids_to_cancel},
+                    session=session,
+                )
                 logger.info(
                     "[JiuWenSwarmDeepAdapter] 已将 session %s 的未完成任务标记为 cancelled",
                     session_id,
