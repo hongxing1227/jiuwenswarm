@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Material Analysis"
+  short_description: "Verify and analyze papers and technical articles"
+  default_prompt: "Use $research-material-analysis to analyze and verify the claims in this paper or article."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repository Activity Digest"
+  short_description: "Analyze recent repository issues and pull requests"
+  default_prompt: "Use $repository-activity-digest to analyze recent issue and pull request activity for a repository."
