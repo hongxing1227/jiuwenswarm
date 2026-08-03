@@ -1,4 +1,4 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
 """AgentWebSocketServer - Gateway 与 AgentServer 之间的 WebSocket 服务端."""
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Optional
 from weakref import WeakValueDictionary
 
+from openjiuwen.core.common.logging import server_logger
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 
 from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService, reset_harness_packages_state
@@ -57,6 +58,7 @@ from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import 
 from jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist import persist_cli_trusted_directory
 from jiuwenswarm.extensions.hooks_context import AgentServerChatHookContext
 from jiuwenswarm.server.runtime.agent_manager import AgentManager, ACP_DEFAULT_CAPABILITIES
+from jiuwenswarm.server.runtime.agent_warm_pool import WarmClaim
 from jiuwenswarm.server.runtime.session.session_metadata import get_all_sessions_metadata, remove_session_metadata_cache
 from jiuwenswarm.server.runtime.session.session_history import (
     append_compact_history_records,
@@ -67,6 +69,7 @@ from jiuwenswarm.server.runtime.session.session_history import (
 )
 from jiuwenswarm.server.runtime.agent_adapter.sysop_builder import (
     build_filesystem_policy,
+    build_yuanrong_sandbox_status_view,
     effective_files_from_policy,
     find_auto_managed_match,
     find_nested_files_conflict,
@@ -111,6 +114,7 @@ from jiuwenswarm.agents.harness.code.prompt.plan_approval import (
     PLAN_MODE_EXITED_EVENT_TYPE,
 )
 from jiuwenswarm.common.schema.message import ReqMethod
+from jiuwenswarm.common.log_preview import preview_text
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +122,9 @@ logger = logging.getLogger(__name__)
 # task 完成后自动从集合移除(Python 官方推荐模式)。
 _background_permission_reload_tasks: set[asyncio.Task] = set()
 
-# session.create 在 team prepare 完成后回包；可选 KVC 信号异步执行，避免拖慢超时窗口。
-_background_session_create_kvc_tasks: set[asyncio.Task] = set()
+# Session owner preparation completes before the response. Optional KVC signals
+# run after the response so affinity latency cannot fail a UI session change.
+_background_session_kvc_tasks: set[asyncio.Task] = set()
 
 
 async def _reset_active_browser_runtimes_if_available(browser_move: Any) -> int:
@@ -149,20 +154,34 @@ def _log_permission_reload_failure(task: asyncio.Task) -> None:
         )
 
 
-def _log_session_create_kvc_failure(task: asyncio.Task) -> None:
-    """session.create 异步 KVC 失败时记 warning，不影响已成功回包的会话。"""
+def _log_background_session_kvc_failure(task: asyncio.Task) -> None:
+    """Log optional post-response KVC failures without changing session state."""
     if task.cancelled():
         return
     exc = task.exception()
     if exc is not None:
         logger.warning(
-            "[AgentWebSocketServer] session.create KVC failed after ack: %s",
+            "[AgentWebSocketServer] %s failed after ack: %s",
+            task.get_name(),
             exc,
             exc_info=exc,
         )
 
 # Serialize plan-mode restore per session to avoid checkpoint races.
 _session_mode_sync_locks: WeakValueDictionary[str, asyncio.Lock] = (
+    WeakValueDictionary()
+)
+
+# Serialize switch owner preparation and acknowledgements per client
+# connection. AgentServer handles WebSocket frames in independent tasks, so
+# rapid navigation requests would otherwise race even on one socket.
+_session_switch_locks: WeakValueDictionary[str, asyncio.Lock] = (
+    WeakValueDictionary()
+)
+
+# Serialize automatic team creation per session. The lock is weakly held so
+# one-shot chat sessions do not accumulate process-lifetime state.
+_session_team_binding_locks: WeakValueDictionary[str, asyncio.Lock] = (
     WeakValueDictionary()
 )
 
@@ -389,6 +408,11 @@ def _is_restorable_history_record(record: Any) -> bool:
         )
 
     if role == "user":
+        mode = record.get("mode", "")
+        if mode in ("team", "team.plan", "code.team"):
+            channel_id = record.get("channel_id", "")
+            if channel_id not in ("web", "tui"):
+                return False
         return has_content or has_media
 
     event_type = record.get("event_type")
@@ -531,7 +555,11 @@ def _harness_error_code(exc: BaseException) -> str:
     return "BAD_REQUEST"
 
 
-def resolve_agent_request_mode(raw_mode: Any) -> tuple[str, str | None, str]:
+def resolve_agent_request_mode(
+    raw_mode: Any,
+    *,
+    work_mode: Any = None,
+) -> tuple[str, str | None, str]:
     """Resolve request params.mode into manager mode, sub_mode, and canonical value.
 
     plan / fast 已合并为单一 ``agent`` 模式：任何 ``agent`` / ``agent.plan`` /
@@ -543,14 +571,21 @@ def resolve_agent_request_mode(raw_mode: Any) -> tuple[str, str | None, str]:
     mode_text = raw_value.strip().lower() if isinstance(raw_value, str) else ""
     if not mode_text:
         mode_text = "agent"
+    normalized_work_mode = (
+        work_mode.strip().lower() if isinstance(work_mode, str) else ""
+    )
 
     if mode_text in ("plan", "fast"):
+        if normalized_work_mode == "code":
+            return "code", "normal", "code.normal"
         return "agent", None, "agent"
 
     parts = mode_text.split(".")
     mode = parts[0] or "agent"
     if mode == "agent":
         # 合并模式：忽略历史子模式（plan / fast），统一 canonical "agent"。
+        if normalized_work_mode == "code":
+            return "code", "normal", "code.normal"
         return "agent", None, "agent"
     if mode == "team":
         sub_mode = parts[1] if len(parts) > 1 and parts[1] else None
@@ -568,12 +603,22 @@ def resolve_agent_request_mode(raw_mode: Any) -> tuple[str, str | None, str]:
     if mode == "code" and sub_mode not in {"plan", "normal", "team"}:
         sub_mode = default_sub_modes.get(mode, "normal")
     canonical_mode = f"{mode}.{sub_mode}" if sub_mode else mode
+    if canonical_mode in {"agent", "code", "code.normal"}:
+        if normalized_work_mode == "code":
+            return "code", "normal", "code.normal"
+        if normalized_work_mode == "work":
+            return "agent", None, "agent"
     return mode, sub_mode, canonical_mode
 
 
-def _apply_resolved_mode_to_request(request: AgentRequest) -> tuple[str, str | None]:
+def _apply_resolved_mode_to_request(
+    request: AgentRequest,
+    *,
+    work_mode: Any = None,
+) -> tuple[str, str | None]:
     mode, sub_mode, canonical_mode = resolve_agent_request_mode(
-        request.params.get("mode", "agent")
+        request.params.get("mode", "agent"),
+        work_mode=work_mode,
     )
     request.params["mode"] = canonical_mode
     return mode, sub_mode
@@ -1001,6 +1046,13 @@ class AgentWebSocketServer:
             endpoint = get_sandbox_endpoint()
             url = endpoint.get("url") or "http://127.0.0.1:8321"
             sandbox_type = endpoint.get("type") or "jiuwenbox"
+            # yuanrong 不需要本机 jiuwenbox 进程; 仅通过 config 启用 SysOperation。
+            if str(sandbox_type).strip().lower() == "yuanrong":
+                logger.info(
+                    "[AgentWebSocketServer] sandbox.type=yuanrong, skipping "
+                    "jiuwenbox auto-start (YuanRong uses YR_* env + yr.init)"
+                )
+                return
             raw_policy = endpoint.get("policy_file") or ""
             effective_policy_file = raw_policy or DEFAULT_SANDBOX_POLICY_FILE
             policy_path = resolve_sandbox_policy_path(effective_policy_file)
@@ -1324,6 +1376,17 @@ class AgentWebSocketServer:
             request.is_stream,
         )
 
+        # First touch point of frontend chat input inside AgentServer: record it through the
+        # agent-core logging system so it lands in the unified agent log stream.
+        if request.req_method == ReqMethod.CHAT_SEND:
+            server_logger.info(
+                "[AgentServer] chat input received: request_id=%s session_id=%s channel_id=%s query=%s",
+                request.request_id,
+                request.session_id,
+                request.channel_id,
+                preview_text(_request_query_text(request)),
+            )
+
         try:
             if request.channel_id == "acp" and request.req_method != ReqMethod.INITIALIZE:
                 metadata = dict(request.metadata or {})
@@ -1359,6 +1422,21 @@ class AgentWebSocketServer:
                 return
             if request.req_method == ReqMethod.SESSION_REWIND_CONTEXT:
                 await self._handle_session_rewind_context(ws, request, send_lock)
+                return
+            if request.req_method == ReqMethod.TEAM_TEMPLATES_LIST:
+                await self._handle_team_templates_list(ws, request, send_lock)
+                return
+            if request.req_method == ReqMethod.TEAM_BINDINGS_LIST:
+                await self._handle_team_bindings_list(ws, request, send_lock)
+                return
+            if request.req_method == ReqMethod.TEAM_BINDING_CREATE:
+                await self._handle_team_binding_create(ws, request, send_lock)
+                return
+            if request.req_method == ReqMethod.TEAM_BINDING_GENERATE:
+                await self._handle_team_binding_generate(ws, request, send_lock)
+                return
+            if request.req_method == ReqMethod.TEAM_SESSION_BIND:
+                await self._handle_team_session_bind(ws, request, send_lock)
                 return
             if request.req_method == ReqMethod.TEAM_DELETE:
                 await self._handle_team_delete(ws, request, send_lock)
@@ -1443,6 +1521,9 @@ class AgentWebSocketServer:
                 return
             if request.req_method == ReqMethod.AGENT_RELOAD_CONFIG:
                 await self._handle_agent_reload_config(ws, request, send_lock)
+                return
+            if request.req_method == ReqMethod.AGENT_PREWARM_SYNC:
+                await self._handle_agent_prewarm_sync(ws, request, send_lock)
                 return
             if request.req_method == ReqMethod.EXTENSIONS_LIST:
                 await self._handle_extensions_list(ws, request, send_lock)
@@ -1605,6 +1686,7 @@ class AgentWebSocketServer:
                             async with send_lock:
                                 await send_wire_payload(ws, wire)
                 return
+            await self._ensure_auto_team_binding_for_chat(request)
             if request.is_stream:
                 await self._handle_stream(ws, request, send_lock)
             else:
@@ -1870,6 +1952,14 @@ class AgentWebSocketServer:
             _session_mode_sync_locks[session_id] = lock
         return lock
 
+    @staticmethod
+    def _session_team_binding_lock(session_id: str) -> asyncio.Lock:
+        lock = _session_team_binding_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _session_team_binding_locks[session_id] = lock
+        return lock
+
     async def _push_plan_mode_exited(self, request: AgentRequest) -> None:
         """Notify the client that plan mode ended after user approval."""
         session_id = request.session_id
@@ -1915,12 +2005,13 @@ class AgentWebSocketServer:
             return
 
         from openjiuwen.core.single_agent import create_agent_session
+        deep_agent = await agent.ensure_instance()
         session = create_agent_session(
             session_id=session_id,
-            card=agent.get_instance().card,
+            card=deep_agent.card,
         )
         await session.pre_run(inputs=None)
-        state = agent.get_instance().load_state(session)
+        state = deep_agent.load_state(session)
         if state.plan_mode.mode == "normal":
             _plan_exited_sessions.add(session_id)
             await self._push_plan_mode_exited(request)
@@ -2004,7 +2095,41 @@ class AgentWebSocketServer:
         params = request.params if isinstance(request.params, dict) else {}
         _raw_mode = params.get("mode")
         explicit_mode_provided = isinstance(_raw_mode, str) and bool(_raw_mode.strip())
-        mode, sub_mode = _apply_resolved_mode_to_request(request)
+        runtime_work_mode = None
+        sid = str(request.session_id or "").strip()
+        if sid:
+            from jiuwenswarm.server.runtime.session.session_metadata import (
+                get_session_metadata,
+            )
+
+            session_metadata = get_session_metadata(
+                sid,
+                cache_bust=True,
+                enable_writeback=False,
+            )
+            stored_work_mode = (
+                session_metadata.get("work_mode")
+                if isinstance(session_metadata, dict)
+                else None
+            )
+            if isinstance(stored_work_mode, str) and stored_work_mode.strip().lower() in {
+                "code",
+                "work",
+            }:
+                runtime_work_mode = stored_work_mode.strip().lower()
+        if runtime_work_mode is None:
+            request_work_mode = params.get("work_mode")
+            if isinstance(request_work_mode, str) and request_work_mode.strip().lower() in {
+                "code",
+                "work",
+            }:
+                runtime_work_mode = request_work_mode.strip().lower()
+        if runtime_work_mode is not None:
+            params["work_mode"] = runtime_work_mode
+        mode, sub_mode = _apply_resolved_mode_to_request(
+            request,
+            work_mode=runtime_work_mode,
+        )
         agent_mode = "agent" if mode == "auto_harness" else mode
         requested_project_dir = resolve_request_project_dir(request)
         # [改动] 写盘用 canonical mode（request.params["mode"]，已被规范化为
@@ -2042,6 +2167,7 @@ class AgentWebSocketServer:
             request.metadata = dict(request.metadata or {})
             request.metadata["project_dir"] = project_dir
 
+        await self._agent_manager.wait_for_session_prewarm(request.session_id)
         agent = await self._agent_manager.get_agent(
             channel_id=channel_id,
             mode=agent_mode,
@@ -2094,11 +2220,12 @@ class AgentWebSocketServer:
         restored_after_approval = False
         async with self._session_mode_sync_lock(session_id):
             from openjiuwen.core.single_agent import create_agent_session
+            deep_agent = await agent.ensure_instance()
             session = create_agent_session(
-                session_id=request.session_id, card=agent.get_instance().card
+                session_id=request.session_id, card=deep_agent.card
             )
             await session.pre_run(inputs=None)  # 从 checkpointer 加载历史 state
-            state = agent.get_instance().load_state(session)
+            state = deep_agent.load_state(session)
             # 仅在目标模式与当前模式不同时执行模式切换
             mode_changed_to_plan = False
             if state.plan_mode.mode != sub_mode:
@@ -2124,7 +2251,7 @@ class AgentWebSocketServer:
                         # Fallback: plan was completed, checkpoint is authoritative.
                         # Clear slug so this guard is one-shot.
                         state.plan_mode.plan_slug = None
-                        agent.get_instance().save_state(session, state)
+                        deep_agent.save_state(session, state)
                         await session.post_run()
                         blocked = True
                         logger.info(
@@ -2137,7 +2264,7 @@ class AgentWebSocketServer:
                             request.params["mode"] = "code.normal"
                         await self._push_plan_mode_exited(request)
                         return False
-                agent.get_instance().switch_mode(session=session, mode=sub_mode)
+                deep_agent.switch_mode(session=session, mode=sub_mode)
                 if state.plan_mode.mode == "plan" and sub_mode == "normal":
                     restored_after_approval = True
                     logger.info(
@@ -2148,10 +2275,10 @@ class AgentWebSocketServer:
                     mode_changed_to_plan = True
                     # Clear stale plan_slug from previous plan session so
                     # enter_plan_mode creates a fresh plan file.
-                    state = agent.get_instance().load_state(session)
+                    state = deep_agent.load_state(session)
                     if state.plan_mode.plan_slug:
                         state.plan_mode.plan_slug = None
-                        agent.get_instance().save_state(session, state)
+                        deep_agent.save_state(session, state)
                 # switch_mode 内部已通过 save_state 写入 "deepagent" key，
                 # 只需 post_run 持久化到 checkpointer
                 await session.post_run()
@@ -2164,7 +2291,27 @@ class AgentWebSocketServer:
 
         return restored_after_approval
 
-    async def _handle_unary(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+    async def _handle_unary(
+        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+    ) -> None:
+        manager = getattr(self, "_agent_manager", None)
+        foreground = (
+            request.req_method in _CODE_MODE_SYNC_METHODS
+            and manager is not None
+            and hasattr(manager, "begin_foreground_chat")
+            and hasattr(manager, "end_foreground_chat")
+        )
+        if foreground:
+            await manager.begin_foreground_chat()
+        try:
+            await self._handle_unary_impl(ws, request, send_lock)
+        finally:
+            if foreground:
+                await manager.end_foreground_chat()
+
+    async def _handle_unary_impl(
+        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+    ) -> None:
         """非流式处理：调用 process_message，返回一条 E2AResponse 线 JSON。"""
         # 兜底确保 checkpointer 就绪: start() 里改为后台预热后, 首条请求可能赶在
         # 预热完成前到达。ensure_persistent_checkpointer 内部 lock+ready 幂等, 预热
@@ -2243,7 +2390,27 @@ class AgentWebSocketServer:
         )
 
 
-    async def _handle_stream(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+    async def _handle_stream(
+        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+    ) -> None:
+        manager = getattr(self, "_agent_manager", None)
+        foreground = (
+            request.req_method in _CODE_MODE_SYNC_METHODS
+            and manager is not None
+            and hasattr(manager, "begin_foreground_chat")
+            and hasattr(manager, "end_foreground_chat")
+        )
+        if foreground:
+            await manager.begin_foreground_chat()
+        try:
+            await self._handle_stream_impl(ws, request, send_lock)
+        finally:
+            if foreground:
+                await manager.end_foreground_chat()
+
+    async def _handle_stream_impl(
+        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+    ) -> None:
         """流式处理：调用 process_message_stream，逐条发送 E2AResponse 线 JSON。"""
         # 兜底确保 checkpointer 就绪 (见 _handle_unary 同名注释)。
         from jiuwenswarm.server.runtime.agent_adapter.interface_deep import ensure_persistent_checkpointer
@@ -2562,40 +2729,6 @@ class AgentWebSocketServer:
             reason=reason,
         )
 
-    async def _apply_session_switch_lifecycle(
-        self,
-        *,
-        channel_id: str,
-        target_session_id: str,
-        previous_session_id: str,
-        params: dict[str, Any],
-        reason: str,
-    ) -> tuple[bool, str]:
-        """Keep the product runtime owner independent from optional KVC signals."""
-        (
-            target_is_team,
-            resolved_mode,
-            context,
-            team_manager,
-            dispatch_signals,
-        ) = await self._prepare_session_switch_owner(
-            channel_id=channel_id,
-            target_session_id=target_session_id,
-            previous_session_id=previous_session_id,
-            params=params,
-            reason=reason,
-        )
-        await self._dispatch_session_switch_kvc(
-            channel_id=channel_id,
-            target_session_id=target_session_id,
-            previous_session_id=previous_session_id,
-            reason=reason,
-            context=context,
-            team_manager=team_manager,
-            dispatch_signals=dispatch_signals,
-        )
-        return target_is_team, resolved_mode
-
     async def _handle_session_switch(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """Switch product sessions without deleting recoverable session state."""
         params = request.params if isinstance(request.params, dict) else {}
@@ -2610,15 +2743,43 @@ class AgentWebSocketServer:
                 payload={"error": "session_id is required", "code": "BAD_REQUEST"},
                 metadata=request.metadata,
             )
-        else:
-            channel_id = str(request.channel_id or "").strip() or "default"
-            _, resolved_mode = await self._apply_session_switch_lifecycle(
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+
+        channel_id = str(request.channel_id or "").strip() or "default"
+        lock_key = f"{id(ws)}:{channel_id}"
+        switch_lock = _session_switch_locks.get(lock_key)
+        if switch_lock is None:
+            switch_lock = asyncio.Lock()
+            _session_switch_locks[lock_key] = switch_lock
+
+        async with switch_lock:
+            (
+                _,
+                resolved_mode,
+                context,
+                team_manager,
+                dispatch_signals,
+            ) = await self._prepare_session_switch_owner(
                 channel_id=channel_id,
                 target_session_id=target,
                 previous_session_id=previous_session_id,
                 params=params,
                 reason="session.switch: ",
             )
+            kvc_args: dict[str, Any] | None = None
+            if context is not None and dispatch_signals is not None:
+                kvc_args = {
+                    "channel_id": channel_id,
+                    "target_session_id": target,
+                    "previous_session_id": previous_session_id,
+                    "reason": "session.switch: ",
+                    "context": context,
+                    "team_manager": team_manager,
+                    "dispatch_signals": dispatch_signals,
+                }
             resp = AgentResponse(
                 request_id=request.request_id,
                 channel_id=request.channel_id,
@@ -2631,9 +2792,18 @@ class AgentWebSocketServer:
                 metadata=request.metadata,
             )
 
-        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
-        async with send_lock:
-            await send_wire_payload(ws, wire)
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+
+            if kvc_args is not None:
+                kvc_task = asyncio.create_task(
+                    self._dispatch_session_switch_kvc(**kvc_args),
+                    name=f"session-switch-kvc-{target}",
+                )
+                _background_session_kvc_tasks.add(kvc_task)
+                kvc_task.add_done_callback(_background_session_kvc_tasks.discard)
+                kvc_task.add_done_callback(_log_background_session_kvc_failure)
 
     async def _find_team_session_ids(self, team_name: str) -> list[str]:
         from jiuwenswarm.server.runtime.session.session_metadata import get_session_metadata
@@ -2649,8 +2819,7 @@ class AgentWebSocketServer:
 
             session_id = session_dir.name
             metadata = get_session_metadata(session_id)
-            mode = str(metadata.get("mode") or "").strip().lower()
-            if mode != "team":
+            if not self._is_team_metadata_mode(metadata):
                 continue
 
             metadata_team_name = str(metadata.get("team_name") or "").strip()
@@ -2686,11 +2855,527 @@ class AgentWebSocketServer:
                 metadata=request.metadata,
             )
 
+    @staticmethod
+    def _team_binding_payload(binding: Any) -> dict[str, Any]:
+        if hasattr(binding, "to_dict"):
+            return binding.to_dict()
+        if isinstance(binding, dict):
+            return dict(binding)
+        return {}
+
+    @staticmethod
+    def _create_team_binding_from_template(
+        *,
+        team_name: str,
+        template_id: str,
+        config_base: dict[str, Any],
+    ) -> Any:
+        from jiuwenswarm.agents.harness.team import (
+            get_team_template_snapshot,
+            list_team_template_summaries,
+        )
+        from jiuwenswarm.server.runtime.team_binding_store import (
+            TeamBindingStoreError,
+            get_team_binding_store,
+            validate_team_name,
+        )
+        from jiuwenswarm.server.runtime.team_entity_store import get_team_entity_store
+
+        normalized_name = validate_team_name(team_name)
+        template_ids = {
+            str(item.get("template_id") or "")
+            for item in list_team_template_summaries(config_base)
+        }
+        if template_id not in template_ids:
+            raise TeamBindingStoreError("template_id not found", code="NOT_FOUND")
+
+        entity_store = get_team_entity_store()
+        if entity_store.exists(normalized_name):
+            raise TeamBindingStoreError("team_name already exists", code="CONFLICT")
+        template_snapshot = get_team_template_snapshot(config_base, template_id=template_id)
+        binding_store = get_team_binding_store()
+        binding = binding_store.create(team_name=normalized_name, template_id=template_id)
+        try:
+            entity_store.write(
+                team_name=binding.team_name,
+                template_id=binding.template_id,
+                template_snapshot=template_snapshot,
+                created_at=binding.created_at,
+            )
+        except Exception:
+            binding_store.delete(binding.team_name)
+            raise
+        return binding
+
+    @classmethod
+    async def _create_generated_team_binding(
+        cls,
+        *,
+        description: str,
+        config_base: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any]]:
+        """Generate a unique team name and persist its binding and entity."""
+        from jiuwenswarm.agents.harness.team import (
+            generate_team_name,
+            list_team_template_summaries,
+        )
+        from jiuwenswarm.server.runtime.team_binding_store import (
+            TeamBindingStoreError,
+        )
+
+        normalized_description = str(description or "").strip()
+        if not normalized_description:
+            raise TeamBindingStoreError("description is required", code="BAD_REQUEST")
+
+        templates = list_team_template_summaries(config_base)
+        if not templates:
+            raise TeamBindingStoreError("no team template configured", code="NOT_FOUND")
+
+        default_template = templates[0]
+        template_id = str(default_template.get("template_id") or "").strip()
+        generated_name = await generate_team_name(
+            normalized_description,
+            config_base=config_base,
+            template_id=template_id,
+        )
+
+        for candidate_index in range(100):
+            suffix = "" if candidate_index == 0 else f"_{candidate_index + 1}"
+            candidate = f"{generated_name[:64 - len(suffix)]}{suffix}"
+            try:
+                binding = cls._create_team_binding_from_template(
+                    team_name=candidate,
+                    template_id=template_id,
+                    config_base=config_base,
+                )
+                return binding, default_template
+            except TeamBindingStoreError as exc:
+                if exc.code != "CONFLICT":
+                    raise
+
+        raise TeamBindingStoreError(
+            "unable to allocate a unique team_name",
+            code="CONFLICT",
+        )
+
+    async def _ensure_auto_team_binding_for_chat(self, request: AgentRequest) -> Any | None:
+        """Create and bind a team before the first team chat without consuming its query."""
+        if request.req_method != ReqMethod.CHAT_SEND:
+            return None
+
+        params = request.params if isinstance(request.params, dict) else {}
+        if not isinstance(request.params, dict):
+            request.params = params
+        session_id = str(request.session_id or params.get("session_id") or "").strip()
+        if not session_id:
+            return None
+
+        from jiuwenswarm.server.runtime.session.session_metadata import (
+            get_session_metadata,
+            update_session_metadata,
+        )
+
+        metadata = get_session_metadata(session_id, cache_bust=True)
+        raw_mode = params.get("mode")
+        effective_mode = (
+            raw_mode
+            if isinstance(raw_mode, str) and raw_mode.strip()
+            else metadata.get("mode")
+        )
+        _, _, canonical_mode = resolve_agent_request_mode(effective_mode)
+        if not self._is_team_metadata_mode({"mode": canonical_mode}):
+            return None
+
+        existing_team_name = str(metadata.get("team_name") or "").strip()
+        if existing_team_name:
+            params.setdefault("team_name", existing_team_name)
+            template_id = str(metadata.get("team_template_id") or "").strip()
+            if template_id:
+                params.setdefault("team_template_id", template_id)
+            return existing_team_name
+
+        query = _request_query_text(request)
+        if not query:
+            return None
+
+        async with self._session_team_binding_lock(session_id):
+            metadata = get_session_metadata(session_id, cache_bust=True)
+            existing_team_name = str(metadata.get("team_name") or "").strip()
+            if existing_team_name:
+                params.setdefault("team_name", existing_team_name)
+                template_id = str(metadata.get("team_template_id") or "").strip()
+                if template_id:
+                    params.setdefault("team_template_id", template_id)
+                return existing_team_name
+
+            from jiuwenswarm.server.runtime.team_binding_store import get_team_binding_store
+            from jiuwenswarm.server.runtime.team_entity_store import get_team_entity_store
+
+            binding, _template = await self._create_generated_team_binding(
+                description=query,
+                config_base=get_config(),
+            )
+            binding_store = get_team_binding_store()
+            entity_store = get_team_entity_store()
+            try:
+                binding = binding_store.bind_session(
+                    team_name=binding.team_name,
+                    session_id=session_id,
+                )
+                update_session_metadata(
+                    session_id=session_id,
+                    channel_id=request.channel_id or None,
+                    user_content=query,
+                    mode=canonical_mode,
+                    team_name=binding.team_name,
+                    team_template_id=binding.template_id,
+                    touch_last_message_at=False,
+                    sync_write=True,
+                )
+            except Exception:
+                cleanup_errors: list[str] = []
+                cleanup_steps = (
+                    lambda: binding_store.unbind_session(
+                        team_name=binding.team_name,
+                        session_id=session_id,
+                    ),
+                    lambda: binding_store.delete(binding.team_name),
+                    lambda: entity_store.delete_team_directory(binding.team_name),
+                )
+                for cleanup_step in cleanup_steps:
+                    try:
+                        cleanup_step()
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        cleanup_errors.append(str(cleanup_exc))
+                if cleanup_errors:
+                    logger.warning(
+                        "[AgentWebSocketServer] auto team binding rollback incomplete: "
+                        "session_id=%s team_name=%s errors=%s",
+                        session_id,
+                        binding.team_name,
+                        cleanup_errors,
+                    )
+                raise
+
+            params["team_name"] = binding.team_name
+            params["team_template_id"] = binding.template_id
+            request.metadata = dict(request.metadata or {})
+            request.metadata["team_name"] = binding.team_name
+            request.metadata["team_template_id"] = binding.template_id
+            logger.info(
+                "[AgentWebSocketServer] auto-created and bound team before chat: "
+                "session_id=%s team_name=%s template_id=%s",
+                session_id,
+                binding.team_name,
+                binding.template_id,
+            )
+            return binding
+
+    @staticmethod
+    def _is_team_metadata_mode(metadata: dict[str, Any]) -> bool:
+        mode = str(metadata.get("mode") or "").strip().lower()
+        return mode in {"team", "team.plan", "code.team"}
+
+    @staticmethod
+    def _active_team_session_map() -> dict[str, str]:
+        from jiuwenswarm.agents.harness.team import get_all_team_managers
+
+        active: dict[str, str] = {}
+        for manager in get_all_team_managers():
+            snapshot_fn = getattr(manager, "get_runtime_team_snapshot", None)
+            if not callable(snapshot_fn):
+                continue
+            for session_id, info in snapshot_fn().items():
+                team_name = str(info.get("team_name") or "").strip()
+                state = str(info.get("state") or "").strip()
+                if team_name and state in {"active", "pending"}:
+                    active.setdefault(team_name, str(session_id))
+        return active
+
+    @staticmethod
+    def _legacy_team_bindings_from_sessions(known_team_names: set[str]) -> list[dict[str, Any]]:
+        from jiuwenswarm.server.runtime.session.session_metadata import get_session_metadata
+
+        sessions_dir = get_agent_sessions_dir()
+        if not sessions_dir.exists():
+            return []
+
+        legacy: dict[str, dict[str, Any]] = {}
+        for session_dir in sessions_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            metadata = get_session_metadata(session_dir.name, cache_bust=True)
+            if not metadata or not AgentWebSocketServer._is_team_metadata_mode(metadata):
+                continue
+            team_name = str(metadata.get("team_name") or "").strip()
+            if not team_name or team_name in known_team_names:
+                continue
+            item = legacy.setdefault(
+                team_name,
+                {
+                    "team_name": team_name,
+                    "template_id": str(metadata.get("team_template_id") or team_name).strip() or team_name,
+                    "created_at": float(metadata.get("created_at") or session_dir.stat().st_ctime),
+                    "updated_at": float(metadata.get("last_message_at") or session_dir.stat().st_mtime),
+                    "session_ids": [],
+                    "last_session_id": "",
+                    "legacy": True,
+                },
+            )
+            if session_dir.name not in item["session_ids"]:
+                item["session_ids"].append(session_dir.name)
+            if float(metadata.get("last_message_at") or 0) >= float(item.get("updated_at") or 0):
+                item["updated_at"] = float(metadata.get("last_message_at") or session_dir.stat().st_mtime)
+                item["last_session_id"] = session_dir.name
+        return list(legacy.values())
+
+    async def _handle_team_templates_list(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+        from jiuwenswarm.agents.harness.team import list_team_template_summaries
+
+        templates = list_team_template_summaries(get_config())
+        resp = AgentResponse(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            ok=True,
+            payload={"templates": templates},
+            metadata=request.metadata,
+        )
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
+    async def _handle_team_bindings_list(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+        from jiuwenswarm.agents.harness.team import list_team_template_summaries
+        from jiuwenswarm.server.runtime.team_entity_store import ensure_team_entity_for_binding, get_team_entity_store
+        from jiuwenswarm.server.runtime.team_binding_store import get_team_binding_store
+
+        active_by_team = self._active_team_session_map()
+        config_base = get_config()
+        templates = {
+            str(item.get("template_id") or ""): item
+            for item in list_team_template_summaries(config_base)
+        }
+        store = get_team_binding_store()
+        bindings = store.list()
+        bindings_by_name = {binding.team_name: binding for binding in bindings}
+        entity_store = get_team_entity_store()
+        teams = [self._team_binding_payload(binding) for binding in bindings]
+        known_team_names = {str(item.get("team_name") or "") for item in teams}
+        teams.extend(self._legacy_team_bindings_from_sessions(known_team_names))
+
+        enriched: list[dict[str, Any]] = []
+        for item in teams:
+            team_name = str(item.get("team_name") or "").strip()
+            template_id = str(item.get("template_id") or "").strip()
+            active_session_id = active_by_team.get(team_name, "")
+            legacy = bool(item.get("legacy", False))
+            entity = None
+            entity_path = ""
+            if team_name and not legacy:
+                binding = bindings_by_name.get(team_name)
+                if binding is not None:
+                    entity = ensure_team_entity_for_binding(binding, config_base=config_base, store=entity_store)
+                else:
+                    entity = entity_store.get(team_name)
+                if entity is not None:
+                    item["template_id"] = entity.template_id
+                    template_id = entity.template_id
+                    entity_path = str(entity_store.entity_path(team_name))
+            source_template_available = bool(template_id and template_id in templates)
+            team_config_available = entity is not None
+            template_available = bool(team_config_available or source_template_available)
+            selectable = bool(team_name and not active_session_id and not legacy and team_config_available)
+            disabled_reason = ""
+            if active_session_id:
+                disabled_reason = "active"
+            elif legacy:
+                disabled_reason = "legacy"
+            elif not team_config_available:
+                disabled_reason = "team_config_missing"
+            item.update(
+                {
+                    "template_available": template_available,
+                    "source_template_available": source_template_available,
+                    "team_config_available": team_config_available,
+                    "team_config_path": entity_path,
+                    "session_count": len(item.get("session_ids") or []),
+                    "active_session_id": active_session_id,
+                    "selectable": selectable,
+                    "disabled_reason": disabled_reason,
+                }
+            )
+            enriched.append(item)
+
+        enriched.sort(key=lambda row: float(row.get("updated_at") or 0), reverse=True)
+        resp = AgentResponse(
+            request_id=request.request_id,
+            channel_id=request.channel_id,
+            ok=True,
+            payload={"teams": enriched},
+            metadata=request.metadata,
+        )
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
+    async def _handle_team_binding_create(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+        from jiuwenswarm.server.runtime.team_binding_store import TeamBindingStoreError
+        from jiuwenswarm.server.runtime.team_entity_store import TeamEntityStoreError
+
+        params = request.params if isinstance(request.params, dict) else {}
+        team_name = str(params.get("team_name") or "")
+        template_id = str(params.get("template_id") or "").strip()
+        config_base = get_config()
+        try:
+            binding = self._create_team_binding_from_template(
+                team_name=team_name,
+                template_id=template_id,
+                config_base=config_base,
+            )
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload={"team": binding.to_dict()},
+                metadata=request.metadata,
+            )
+        except (TeamBindingStoreError, TeamEntityStoreError) as exc:
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc), "code": getattr(exc, "code", "BAD_REQUEST")},
+                metadata=request.metadata,
+            )
+
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
+    async def _handle_team_binding_generate(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+        from jiuwenswarm.agents.harness.team import (
+            TeamNameGenerationError,
+        )
+        from jiuwenswarm.server.runtime.team_binding_store import TeamBindingStoreError
+        from jiuwenswarm.server.runtime.team_entity_store import TeamEntityStoreError
+
+        params = request.params if isinstance(request.params, dict) else {}
+        description = str(params.get("description") or params.get("prompt") or "").strip()
+        config_base = get_config()
+        try:
+            binding, default_template = await self._create_generated_team_binding(
+                description=description,
+                config_base=config_base,
+            )
+
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload={
+                    "team": binding.to_dict(),
+                    "template": default_template,
+                },
+                metadata=request.metadata,
+            )
+        except TeamNameGenerationError as exc:
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc), "code": "GENERATION_FAILED"},
+                metadata=request.metadata,
+            )
+        except (TeamBindingStoreError, TeamEntityStoreError) as exc:
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc), "code": getattr(exc, "code", "BAD_REQUEST")},
+                metadata=request.metadata,
+            )
+
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
+    async def _handle_team_session_bind(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
+        from jiuwenswarm.server.runtime.session.session_metadata import update_session_metadata
+        from jiuwenswarm.server.runtime.team_binding_store import TeamBindingStoreError, get_team_binding_store
+        from jiuwenswarm.server.runtime.team_entity_store import (
+            TeamEntityStoreError,
+            ensure_team_entity_for_binding,
+            get_team_entity_store,
+        )
+
+        params = request.params if isinstance(request.params, dict) else {}
+        session_id = str(params.get("session_id") or request.session_id or "").strip()
+        team_name = str(params.get("team_name") or "").strip()
+        _, _, canonical_mode = resolve_agent_request_mode(params.get("mode", "team"))
+        try:
+            if not session_id:
+                raise TeamBindingStoreError("session_id is required", code="BAD_REQUEST")
+            if not (get_agent_sessions_dir() / session_id).is_dir():
+                raise TeamBindingStoreError("session not found", code="NOT_FOUND")
+            binding_store = get_team_binding_store()
+            existing_binding = binding_store.get(team_name)
+            if existing_binding is None:
+                raise TeamBindingStoreError("team binding not found", code="NOT_FOUND")
+            entity = ensure_team_entity_for_binding(existing_binding, config_base=get_config())
+            if entity is None:
+                raise TeamBindingStoreError("team entity config missing", code="NOT_FOUND")
+            binding = binding_store.bind_session(
+                team_name=team_name,
+                session_id=session_id,
+            )
+            update_session_metadata(
+                session_id=session_id,
+                channel_id=str(request.channel_id or "").strip() or None,
+                mode=canonical_mode,
+                team_name=binding.team_name,
+                team_template_id=binding.template_id,
+                sync=True,
+            )
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload={
+                    "session_id": session_id,
+                    "team_name": binding.team_name,
+                    "team_template_id": binding.template_id,
+                    "mode": canonical_mode,
+                    "team": binding.to_dict(),
+                    "team_config_path": str(get_team_entity_store().entity_path(binding.team_name)),
+                },
+                metadata=request.metadata,
+            )
+        except (TeamBindingStoreError, TeamEntityStoreError) as exc:
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc), "code": getattr(exc, "code", "BAD_REQUEST")},
+                metadata=request.metadata,
+            )
+
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
     async def _handle_team_delete(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """Delete a team and all team sessions that persist that team."""
         from openjiuwen.core.runner import Runner
         from jiuwenswarm.agents.harness.team import (
             stop_team_session_runtime_across_managers,
+        )
+        from jiuwenswarm.server.runtime.team_binding_store import (
+            TeamBindingStoreError,
+            get_team_binding_store,
+        )
+        from jiuwenswarm.server.runtime.team_entity_store import (
+            TeamEntityStoreError,
+            get_team_entity_store,
         )
 
         params = request.params if isinstance(request.params, dict) else {}
@@ -2717,63 +3402,124 @@ class AgentWebSocketServer:
                 metadata=request.metadata,
             )
         else:
-            checkpoint_resp = await self._ensure_persistent_checkpointer_response(request)
-            if checkpoint_resp is not None:
-                resp = checkpoint_resp
-            else:
+            try:
+                binding_store = get_team_binding_store()
+                entity_store = get_team_entity_store()
                 team_session_ids = await self._find_team_session_ids(team_name)
                 if not team_session_ids:
-                    resp = AgentResponse(
-                        request_id=request.request_id,
-                        channel_id=request.channel_id,
-                        ok=False,
-                        payload={"error": "team sessions not found", "code": "NOT_FOUND"},
-                        metadata=request.metadata,
-                    )
+                    binding = binding_store.get(team_name)
+                    if binding is None and not entity_store.exists(team_name):
+                        resp = AgentResponse(
+                            request_id=request.request_id,
+                            channel_id=request.channel_id,
+                            ok=False,
+                            payload={"error": "team not found", "code": "NOT_FOUND"},
+                            metadata=request.metadata,
+                        )
+                    else:
+                        entity_store.delete_team_directory(team_name)
+                        binding_store.delete(team_name)
+                        resp = AgentResponse(
+                            request_id=request.request_id,
+                            channel_id=request.channel_id,
+                            ok=True,
+                            payload={
+                                "team_name": team_name,
+                                "session_ids": [],
+                                "deleted": True,
+                            },
+                            metadata=request.metadata,
+                        )
                 else:
-                    from jiuwenswarm.agents.harness.team import (
-                        kv_cache_hooks as team_kv_cache_hooks,
-                    )
-
-                    for team_session_id in team_session_ids:
-                        await team_kv_cache_hooks.stop_runtime_before_terminal_delete(
-                            stop_team_session_runtime_across_managers,
-                            session_id=team_session_id,
-                            reason="team.delete: ",
+                    checkpoint_resp = await self._ensure_persistent_checkpointer_response(request)
+                    if checkpoint_resp is not None:
+                        resp = checkpoint_resp
+                    else:
+                        from jiuwenswarm.agents.harness.team import (
+                            kv_cache_hooks as team_kv_cache_hooks,
                         )
 
-                    await Runner.delete_agent_team(
-                        team_name=team_name,
-                        session_ids=team_session_ids,
-                        force=True,
-                    )
+                        for team_session_id in team_session_ids:
+                            await team_kv_cache_hooks.stop_runtime_before_terminal_delete(
+                                stop_team_session_runtime_across_managers,
+                                session_id=team_session_id,
+                                reason="team.delete: ",
+                            )
 
-                    for team_session_id in team_session_ids:
-                        session_dir = get_agent_sessions_dir() / team_session_id
-                        if session_dir.exists():
-                            try:
-                                shutil.rmtree(session_dir)
-                            except Exception as exc:
-                                logger.warning(
-                                    "[AgentWebSocketServer] failed to delete local team session dir: "
-                                    "session_id=%s error=%s",
-                                    team_session_id,
-                                    exc,
+                        runtime_deleted = await Runner.delete_agent_team(
+                            team_name=team_name,
+                            session_ids=team_session_ids,
+                            force=True,
+                        )
+                        if not runtime_deleted:
+                            resp = AgentResponse(
+                                request_id=request.request_id,
+                                channel_id=request.channel_id,
+                                ok=False,
+                                payload={
+                                    "error": "agent team runtime cleanup failed",
+                                    "code": "DELETE_FAILED",
+                                    "team_name": team_name,
+                                    "deleted": False,
+                                },
+                                metadata=request.metadata,
+                            )
+                        else:
+                            failed_session_ids: list[str] = []
+                            for team_session_id in team_session_ids:
+                                session_dir = get_agent_sessions_dir() / team_session_id
+                                if session_dir.exists():
+                                    try:
+                                        shutil.rmtree(session_dir)
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "[AgentWebSocketServer] failed to delete local team session dir: "
+                                            "session_id=%s error=%s",
+                                            team_session_id,
+                                            exc,
+                                        )
+                                        failed_session_ids.append(team_session_id)
+                                        continue
+                                remove_session_metadata_cache(team_session_id)
+
+                            if failed_session_ids:
+                                resp = AgentResponse(
+                                    request_id=request.request_id,
+                                    channel_id=request.channel_id,
+                                    ok=False,
+                                    payload={
+                                        "error": "failed to delete local team session directories",
+                                        "code": "DELETE_FAILED",
+                                        "team_name": team_name,
+                                        "failed_session_ids": failed_session_ids,
+                                        "deleted": False,
+                                    },
+                                    metadata=request.metadata,
                                 )
-                                continue
-                        remove_session_metadata_cache(team_session_id)
-
-                    resp = AgentResponse(
-                        request_id=request.request_id,
-                        channel_id=request.channel_id,
-                        ok=True,
-                        payload={
-                            "team_name": team_name,
-                            "session_ids": team_session_ids,
-                            "deleted": True,
-                        },
-                        metadata=request.metadata,
-                    )
+                            else:
+                                # agent-core normally removes team_home; retry here because it logs and
+                                # suppresses filesystem cleanup failures.
+                                entity_store.delete_team_directory(team_name)
+                                binding_store.delete(team_name)
+                                resp = AgentResponse(
+                                    request_id=request.request_id,
+                                    channel_id=request.channel_id,
+                                    ok=True,
+                                    payload={
+                                        "team_name": team_name,
+                                        "session_ids": team_session_ids,
+                                        "deleted": True,
+                                    },
+                                    metadata=request.metadata,
+                                )
+            except (TeamBindingStoreError, TeamEntityStoreError) as exc:
+                resp = AgentResponse(
+                    request_id=request.request_id,
+                    channel_id=request.channel_id,
+                    ok=False,
+                    payload={"error": str(exc), "code": getattr(exc, "code", "DELETE_FAILED")},
+                    metadata=request.metadata,
+                )
 
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
         async with send_lock:
@@ -2796,8 +3542,20 @@ class AgentWebSocketServer:
                 metadata=request.metadata,
             )
         else:
-            session_dir = get_agent_sessions_dir() / target
-            if not session_dir.exists():
+            from jiuwenswarm.server.runtime.session.session_history import resolve_session_dir
+
+            session_dir, invalid_reason = resolve_session_dir(
+                target, sessions_root=get_agent_sessions_dir()
+            )
+            if session_dir is None:
+                resp = AgentResponse(
+                    request_id=request.request_id,
+                    channel_id=request.channel_id,
+                    ok=False,
+                    payload={"error": invalid_reason or "invalid session_id", "code": "BAD_REQUEST"},
+                    metadata=request.metadata,
+                )
+            elif not session_dir.exists():
                 resp = AgentResponse(
                     request_id=request.request_id,
                     channel_id=request.channel_id,
@@ -2819,9 +3577,10 @@ class AgentWebSocketServer:
                     resp = checkpoint_resp
                 else:
                     metadata = get_session_metadata(target)
-                    mode = str(metadata.get("mode") or "").strip().lower()
+                    is_team_mode = self._is_team_metadata_mode(metadata)
+                    team_name = str(metadata.get("team_name") or "").strip()
                     channel_id = str(metadata.get("channel_id") or request.channel_id or "").strip() or None
-                    if mode != "team":
+                    if not is_team_mode:
                         from jiuwenswarm.server.runtime.session.kv_cache_product_hooks import (
                             evict_plan_session,
                         )
@@ -2832,7 +3591,7 @@ class AgentWebSocketServer:
                             channel_id=channel_id,
                         )
                     try:
-                        if mode == "team":
+                        if is_team_mode:
                             team_manager = get_team_manager(channel_id)
                             deleted = await team_manager.delete_session_runtime(
                                 target,
@@ -2861,6 +3620,22 @@ class AgentWebSocketServer:
                         shutil.rmtree(session_dir)
                         _plan_exited_sessions.discard(target)
                         remove_session_metadata_cache(target)
+                        if is_team_mode:
+                            try:
+                                from jiuwenswarm.server.runtime.team_binding_store import get_team_binding_store
+
+                                get_team_binding_store().unbind_session(
+                                    team_name=team_name or None,
+                                    session_id=target,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[AgentWebSocketServer] failed to unbind deleted team session: "
+                                    "session_id=%s team_name=%s error=%s",
+                                    target,
+                                    team_name,
+                                    exc,
+                                )
                         resp = AgentResponse(
                             request_id=request.request_id,
                             channel_id=request.channel_id,
@@ -2873,14 +3648,58 @@ class AgentWebSocketServer:
         async with send_lock:
             await send_wire_payload(ws, wire)
 
-    def _resolve_rewind_agent(self, channel_id: str) -> tuple[Any, Any] | None:
-        """Return (deep_agent, react_agent) for the given channel, or None."""
+    async def _resolve_rewind_agent(
+        self,
+        channel_id: str,
+        session_id: str | None = None,
+    ) -> tuple[Any, Any] | None:
+        """Return (deep_agent, react_agent) for rewind context rebuild.
+
+        Prefer the live **session-scoped** DeepAgent used by chat.send.
+        Root ``agent.get_instance()`` is a separate DeepAgent whose
+        context_engine / ``_interaction_session`` are not the ones the next
+        user turn will read — updating them leaves the model still seeing
+        rewound turns.
+        """
         agent = self._agent_manager.get_agent_nowait(
             channel_id=channel_id or "default"
         )
         if agent is None:
             return None
-        deep_agent = agent.get_instance()
+
+        deep_agent = None
+        sid = str(session_id or "").strip()
+        if sid:
+            adapter = self._resolve_adapter(agent)
+            if adapter is not None:
+                # Already session-scoped (rare): use it directly.
+                if getattr(adapter, "_is_session_scoped_adapter", False):
+                    deep_agent = getattr(adapter, "_instance", None)
+                else:
+                    get_cached = getattr(adapter, "_get_cached_session_adapter", None)
+                    if callable(get_cached):
+                        session_adapter = get_cached(sid)
+                        if session_adapter is not None:
+                            deep_agent = getattr(session_adapter, "_instance", None)
+                            if deep_agent is None:
+                                logger.warning(
+                                    "[AgentWS] rewind: cached session adapter has no "
+                                    "instance for session_id=%s",
+                                    sid,
+                                )
+
+        if deep_agent is None:
+            # Fallback: no live session adapter yet (e.g. rewind before any chat
+            # on this process). Checkpointer-only rebuild still helps cold start,
+            # so build the root DeepAgent here if it has not been needed yet.
+            deep_agent = await agent.ensure_instance()
+            if deep_agent is not None and sid:
+                logger.info(
+                    "[AgentWS] rewind: no session-scoped DeepAgent for %s; "
+                    "falling back to root instance",
+                    sid,
+                )
+
         if deep_agent is None:
             return None
         react_agent = deep_agent.react_agent
@@ -2973,8 +3792,19 @@ class AgentWebSocketServer:
             # converts ALL records to context messages, so it naturally produces the
             # correct result for both "from" and "up_to" directions.
             context_ok = False
-            pair = self._resolve_rewind_agent(request.channel_id or "default")
-            if pair is not None:
+            pair = await self._resolve_rewind_agent(
+                request.channel_id or "default",
+                session_id=target_sid,
+            )
+            if pair is None:
+                logger.warning(
+                    "[AgentWS] session.rewind: no agent for context rebuild "
+                    "(session_id=%s channel=%s); history truncated but model "
+                    "context may still contain rewound turns",
+                    target_sid,
+                    request.channel_id,
+                )
+            else:
                 deep_agent, _react_agent = pair
                 try:
                     context_ok = await rewind_session_context(
@@ -2985,6 +3815,12 @@ class AgentWebSocketServer:
                 except Exception as exc:
                     logger.warning(
                         "[AgentWS] session.rewind context truncation failed: %s", exc,
+                    )
+                if not context_ok:
+                    logger.warning(
+                        "[AgentWS] session.rewind: history truncated but "
+                        "rewind_context=false (session_id=%s)",
+                        target_sid,
                     )
 
             payload = {**rewind_result, "rewind_context": context_ok}
@@ -3130,7 +3966,10 @@ class AgentWebSocketServer:
                 await send_wire_payload(ws, wire)
             return
 
-        pair = self._resolve_rewind_agent(request.channel_id or "default")
+        pair = await self._resolve_rewind_agent(
+            request.channel_id or "default",
+            session_id=target_sid,
+        )
         if pair is None:
             wire = AgentWebSocketServer._send_error_response(
                 ws, request, send_lock, "no agent instance available",
@@ -3832,7 +4671,10 @@ class AgentWebSocketServer:
                 request_id=request.request_id,
                 channel_id=request.channel_id,
                 ok=False,
-                payload={"error": str(e)},
+                payload={
+                    "error": str(e),
+                    "code": "BAD_REQUEST" if isinstance(e, ValueError) else "SESSION_CREATE_FAILED",
+                },
             )
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
         async with send_lock:
@@ -4908,46 +5750,73 @@ class AgentWebSocketServer:
         ``enable``/``disable`` 走 ``agent_manager.recreate_agent`` (重建 sys_operation 类型);
         其他写动作通过 ``adapter.apply_sandbox_runtime_patch()`` 立即热更,
         不重建 agent.
+
+        当 ``sandbox.type=yuanrong`` 时仅允许 ``status`` (裸 ``/sandbox`` 查看
+        enabled/executor/mounts); 任意子指令一律拒绝。
         """
         params = request.params or {}
-        sub = str(params.get("sub", "status")).strip().lower()
+        sub = str(params.get("sub", "status")).strip().lower() or "status"
         channel_id = request.channel_id or "default"
         try:
             # 平台守卫: ``/sandbox`` 全家桶仅在 Linux 上可用。 放在 try 内部是
             # 故意的, 让 ValueError 命中下方 ``except ValueError`` 分支转成
             # ``SANDBOX_BAD_REQUEST`` 回执, 跟其它入参校验失败的处理一致。
             _require_sandbox_supported()
-            validate_sandbox_files_runtime(get_sandbox_runtime().get("files"))
-            if sub == "status":
-                payload = {"runtime": get_sandbox_runtime()}
-            elif sub == "enable":
-                payload = await self._handle_sandbox_enable(channel_id)
-            elif sub == "disable":
-                payload = await self._handle_sandbox_disable(channel_id)
-            elif sub == "exclude.add":
-                payload = await self._handle_sandbox_exclude_add(channel_id, params)
-            elif sub == "exclude.remove":
-                payload = await self._handle_sandbox_exclude_remove(channel_id, params)
-            elif sub == "exclude.list":
-                payload = {"excluded_commands": list(get_sandbox_runtime().get("excluded_commands") or [])}
-            elif sub == "files.allow":
-                payload = await self._handle_sandbox_files_set(channel_id, params, bucket="allow")
-            elif sub == "files.deny":
-                payload = await self._handle_sandbox_files_set(channel_id, params, bucket="deny")
-            elif sub == "files.remove":
-                payload = await self._handle_sandbox_files_remove(channel_id, params)
-            elif sub == "files.list":
-                payload = {"files": dict(get_sandbox_runtime().get("files") or {})}
+            endpoint = get_sandbox_endpoint()
+            sandbox_type = str(endpoint.get("type") or "").strip().lower()
+            if sandbox_type == "yuanrong":
+                if sub != "status":
+                    raise ValueError(
+                        "sandbox.type=yuanrong: only /sandbox (view config) is "
+                        "supported; subcommands are disabled"
+                    )
+                payload = build_yuanrong_sandbox_status_view()
+                resp = AgentResponse(
+                    request_id=request.request_id,
+                    channel_id=request.channel_id,
+                    ok=True,
+                    payload=payload,
+                )
             else:
-                raise ValueError(f"unknown sub: {sub!r}")
-            self._attach_effective_sandbox_files(payload, channel_id, params)
-            await self._attach_landlock_status(payload)
-            resp = AgentResponse(
-                request_id=request.request_id,
-                channel_id=request.channel_id,
-                ok=True,
-                payload=payload,
-            )
+                validate_sandbox_files_runtime(get_sandbox_runtime().get("files"))
+                if sub == "status":
+                    payload = {"runtime": get_sandbox_runtime()}
+                elif sub == "enable":
+                    payload = await self._handle_sandbox_enable(channel_id)
+                elif sub == "disable":
+                    payload = await self._handle_sandbox_disable(channel_id)
+                elif sub == "exclude.add":
+                    payload = await self._handle_sandbox_exclude_add(channel_id, params)
+                elif sub == "exclude.remove":
+                    payload = await self._handle_sandbox_exclude_remove(channel_id, params)
+                elif sub == "exclude.list":
+                    payload = {
+                        "excluded_commands": list(
+                            get_sandbox_runtime().get("excluded_commands") or []
+                        )
+                    }
+                elif sub == "files.allow":
+                    payload = await self._handle_sandbox_files_set(
+                        channel_id, params, bucket="allow"
+                    )
+                elif sub == "files.deny":
+                    payload = await self._handle_sandbox_files_set(
+                        channel_id, params, bucket="deny"
+                    )
+                elif sub == "files.remove":
+                    payload = await self._handle_sandbox_files_remove(channel_id, params)
+                elif sub == "files.list":
+                    payload = {"files": dict(get_sandbox_runtime().get("files") or {})}
+                else:
+                    raise ValueError(f"unknown sub: {sub!r}")
+                self._attach_effective_sandbox_files(payload, channel_id, params)
+                await self._attach_landlock_status(payload)
+                resp = AgentResponse(
+                    request_id=request.request_id,
+                    channel_id=request.channel_id,
+                    ok=True,
+                    payload=payload,
+                )
         except ValueError as exc:
             resp = AgentResponse(
                 request_id=request.request_id,
@@ -6231,6 +7100,35 @@ class AgentWebSocketServer:
         async with send_lock:
             await send_wire_payload(ws, wire)
 
+    async def _handle_agent_prewarm_sync(
+        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+    ) -> None:
+        """Reconcile background prewarming for the Gateway's live channels."""
+        params = request.params if isinstance(request.params, dict) else {}
+        raw_channels = params.get("enabled_channels")
+        if not isinstance(raw_channels, list):
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": "enabled_channels must be a list", "code": "BAD_REQUEST"},
+            )
+        else:
+            stats = await self._agent_manager.sync_prewarm_channels(
+                [str(channel) for channel in raw_channels],
+                config=params.get("config"),
+                env=params.get("env"),
+            )
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload=stats,
+            )
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
     async def _handle_agent_reload_config(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         try:
             params = request.params or {}
@@ -6403,7 +7301,7 @@ class AgentWebSocketServer:
             # 1. 确保 agent 实例已设置（用于热更新）
             agent = self._agent_manager.get_agent_nowait()
             if agent is not None:
-                agent_instance = agent.get_instance()
+                agent_instance = await agent.ensure_instance()
                 if agent_instance is not None:
                     manager.set_agent_instance(agent_instance)
 
@@ -6621,32 +7519,100 @@ class AgentWebSocketServer:
     async def _handle_session_create(
             self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
     ) -> None:
-        """处理 session.create 方法.
+        """Handle AgentServer-owned creation and TUI external-ID compatibility.
 
-        调用 AgentManager.create_session 创建会话，返回 session_id。
-        同时将 project_dir/project_id 等字段写入会话元数据(metadata.json)并落盘。
-        project_id / project_dir 绑定规则(详见
-        project_store.resolve_session_project_binding):两者皆空→默认项目;
-        仅传 project_id→自动补齐 path;同时传→校验一致性;仅传 path→拒绝。
+        Normal creation validates project identity before claiming a server-owned
+        warm or fresh Session. TUI callers may supply a compatibility ID through
+        this same method; AgentServer validates and serializes it, restores or
+        persists its binding, and always bypasses prewarming.
 
         Args:
             ws: WebSocket 连接
             request: AgentRequest
             send_lock: 发送锁
         """
-        logger.info("[AgentServer] session.create: request_id=%s", request.request_id)
+        operation = "session.create"
+        logger.info("[AgentServer] %s: request_id=%s", operation, request.request_id)
 
         try:
             channel_id = request.channel_id or "default"
             params = request.params if isinstance(request.params, dict) else {}
-            mode, _, _ = resolve_agent_request_mode(params.get("mode", "agent"))
+            mode, _, canonical_mode = resolve_agent_request_mode(params.get("mode", "agent"))
             explicit_session_id = params.get("session_id")
             previous_session_id = str(params.get("previous_session_id") or "").strip()
-            session_id = await self._agent_manager.create_session(
-                channel_id=channel_id,
-                session_id=str(explicit_session_id).strip() if isinstance(explicit_session_id, str) else None,
+            requested_session_id = (
+                explicit_session_id.strip()
+                if isinstance(explicit_session_id, str)
+                else ""
             )
+            external_tui_session = bool(
+                requested_session_id
+                and request.req_method == ReqMethod.SESSION_CREATE
+                and channel_id.strip().lower() == "tui"
+            )
+            existing_metadata: dict[str, Any] | None = None
+            if requested_session_id and not external_tui_session:
+                raise ValueError(
+                    "session.create no longer accepts session_id; use session.switch to restore"
+                )
+            external_id_lock: asyncio.Lock | None = None
+            external_id_lock_acquired = False
+            if external_tui_session:
+                logger.warning(
+                    "[AgentServer] TUI supplied session_id via session.create; "
+                    "bypassing prewarm compatibility path: session_id=%s",
+                    requested_session_id,
+                )
+                from jiuwenswarm.server.runtime.prompt_attachment_loader import (
+                    sanitize_session_id,
+                )
+                if (
+                    sanitize_session_id(requested_session_id) != requested_session_id
+                    or len(requested_session_id) > 128
+                ):
+                    raise ValueError("invalid session_id")
 
+                lock_key = f"external-create:{requested_session_id}"
+                external_id_lock = _session_switch_locks.get(lock_key)
+                if external_id_lock is None:
+                    external_id_lock = asyncio.Lock()
+                    _session_switch_locks[lock_key] = external_id_lock
+                await external_id_lock.acquire()
+                external_id_lock_acquired = True
+
+                # Existing TUI metadata is authoritative. The frontend injects its
+                # current cwd into every RPC, which must not rebind a restored session
+                # when `--session` is launched from another directory.
+                from jiuwenswarm.server.runtime.session.session_metadata import (
+                    get_session_metadata,
+                )
+                existing_metadata = get_session_metadata(requested_session_id)
+                if existing_metadata:
+                    existing_channel = str(
+                        existing_metadata.get("channel_id") or ""
+                    ).strip().lower()
+                    if existing_channel not in {"", "tui"}:
+                        raise ValueError("session_id is already owned by another channel")
+                    for field in ("project_id", "project_dir", "work_mode", "mode"):
+                        value = existing_metadata.get(field)
+                        if isinstance(value, str) and value.strip():
+                            params[field] = value.strip()
+                    mode, _, canonical_mode = resolve_agent_request_mode(
+                        params.get("mode", "agent")
+                    )
+                else:
+                    # Resolve a new external TUI id while holding the per-id lock.
+                    # This keeps concurrent windows from rebinding the same id to
+                    # different projects before metadata becomes visible.
+                    from jiuwenswarm.server.runtime.session.project_store import (
+                        find_or_create_code_project_for_tui_params,
+                    )
+
+                    project = find_or_create_code_project_for_tui_params(params)
+                    if project is not None:
+                        params["project_id"] = project.project_id
+                        params["project_dir"] = project.project_dir
+                        params["work_mode"] = project.work_mode
             # Step 1: 归一化 work_mode / project_id / project_dir 三元组
             # (与 web _session_create 共用同一 helper，保持主路径/fallback 一致)
             from jiuwenswarm.server.runtime.session.work_mode import resolve_session_work_mode_params
@@ -6745,37 +7711,102 @@ class AgentWebSocketServer:
             params["project_dir"] = project_dir
             params["work_mode"] = final_work_mode
 
+            is_swarm = bool(params.get("is_swarm")) or canonical_mode in {
+                "team",
+                "team.plan",
+                "code.team",
+            }
+            if not is_swarm:
+                mode, _, canonical_mode = resolve_agent_request_mode(
+                    canonical_mode,
+                    work_mode=final_work_mode,
+                )
+                params["mode"] = canonical_mode
+            prewarm_eligible = (
+                not is_swarm
+                and canonical_mode in {"agent", "code", "code.normal"}
+            )
+            create_token = str(params.get("create_token") or "").strip()
+            if external_tui_session:
+                claim = WarmClaim(
+                    session_id=requested_session_id,
+                    prewarm_hit=False,
+                    prewarm_status="bypassed",
+                )
+            else:
+                if not create_token:
+                    raise ValueError("create_token is required")
+                claim = await self._agent_manager.claim_prewarmed_session(
+                    channel_id=channel_id,
+                    project_id=project_id,
+                    project_dir=project_dir,
+                    work_mode=final_work_mode,
+                    is_swarm=is_swarm,
+                    prewarm_eligible=prewarm_eligible,
+                    create_token=create_token,
+                )
+            session_id = claim.session_id
+
             # 会话目录已存在则拒绝,避免覆盖既有会话元数据(与 web 本地 handler 一致)
             session_dir = get_agent_sessions_dir() / session_id
-            if session_dir.exists():
-                resp = AgentResponse(
-                    request_id=request.request_id,
-                    channel_id=request.channel_id,
-                    ok=False,
-                    payload={"error": "session already exists", "code": "ALREADY_EXISTS"},
-                )
-                wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
-                async with send_lock:
-                    await send_wire_payload(ws, wire)
-                return
+            if (session_dir / "metadata.json").is_file():
+                if not external_tui_session:
+                    self._agent_manager.activate_session_prewarm(session_id)
+                    resp = AgentResponse(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        ok=True,
+                        payload={
+                            "sessionId": session_id,
+                            "session_id": session_id,
+                            "projectId": project_id,
+                            "projectDir": project_dir,
+                            "workMode": final_work_mode,
+                            "prewarm_hit": claim.prewarm_hit,
+                            "prewarm_status": claim.prewarm_status,
+                        },
+                    )
+                    wire = encode_agent_response_for_wire(
+                        resp, response_id=request.request_id
+                    )
+                    async with send_lock:
+                        await send_wire_payload(ws, wire)
+                    return
+                session_created = False
+            else:
+                session_created = True
 
             # 初始化会话元数据(同步写盘),将 project_dir/project_id 等字段落盘
-            from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
-            init_session_metadata(
-                session_id=session_id,
-                channel_id=params.get("channel_id", ""),
-                user_id=params.get("user_id", ""),
-                title=params.get("title", ""),
-                mode=mode,
-                project_dir=project_dir,
-                project_id=project_id,
-                work_mode=final_work_mode,
-            )
+            if session_created:
+                from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
+                channel_metadata = None
+                if channel_id.strip().lower() == "tui":
+                    workspace = str(params.get("cwd") or project_dir or "").strip()
+                    if workspace:
+                        channel_metadata = {
+                            "cwd": workspace,
+                            "project_dir": project_dir or workspace,
+                        }
+                init_session_metadata(
+                    session_id=session_id,
+                    channel_id=channel_id,
+                    user_id=params.get("user_id", ""),
+                    title=params.get("title", ""),
+                    mode=canonical_mode,
+                    project_dir=project_dir,
+                    project_id=project_id,
+                    work_mode=final_work_mode,
+                    cron_id=str(params.get("cron_id") or "").strip(),
+                    channel_metadata=channel_metadata,
+                )
+                if not external_tui_session:
+                    self._agent_manager.activate_session_prewarm(session_id)
 
             # team prepare 必须在 ack 前完成，避免首条 chat.send 与分布式切换竞态；
             # 可选 KVC 信号放到回包后异步，避免拖慢 create RPC。
             lifecycle_params = dict(params)
-            lifecycle_params["mode"] = mode
+            lifecycle_params["mode"] = canonical_mode
+            lifecycle_reason = "session.create switch: "
             (
                 _target_is_team,
                 _resolved_mode,
@@ -6787,7 +7818,7 @@ class AgentWebSocketServer:
                 target_session_id=session_id,
                 previous_session_id=previous_session_id,
                 params=lifecycle_params,
-                reason="session.create switch: ",
+                reason=lifecycle_reason,
             )
 
             resp = AgentResponse(
@@ -6796,16 +7827,24 @@ class AgentWebSocketServer:
                 ok=True,
                 payload={
                     "sessionId": session_id,
+                    "session_id": session_id,
                     "projectId": project_id,
                     "projectDir": project_dir,
                     "workMode": final_work_mode,
+                    "prewarm_hit": claim.prewarm_hit,
+                    "prewarm_status": claim.prewarm_status,
+                    **(
+                        {"created": session_created, "mode": canonical_mode}
+                        if external_tui_session
+                        else {}
+                    ),
                 },
             )
             wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
             async with send_lock:
                 await send_wire_payload(ws, wire)
 
-            logger.info("[AgentServer] session.create completed: session_id=%s", session_id)
+            logger.info("[AgentServer] %s completed: session_id=%s", operation, session_id)
 
             if switch_context is not None and dispatch_signals is not None:
                 kvc_task = asyncio.create_task(
@@ -6813,19 +7852,23 @@ class AgentWebSocketServer:
                         channel_id=channel_id,
                         target_session_id=session_id,
                         previous_session_id=previous_session_id,
-                        reason="session.create switch: ",
+                        reason=lifecycle_reason,
                         context=switch_context,
                         team_manager=team_manager,
                         dispatch_signals=dispatch_signals,
                     ),
                     name=f"session-create-kvc-{session_id}",
                 )
-                _background_session_create_kvc_tasks.add(kvc_task)
-                kvc_task.add_done_callback(_background_session_create_kvc_tasks.discard)
-                kvc_task.add_done_callback(_log_session_create_kvc_failure)
+                _background_session_kvc_tasks.add(kvc_task)
+                kvc_task.add_done_callback(_background_session_kvc_tasks.discard)
+                kvc_task.add_done_callback(_log_background_session_kvc_failure)
 
         except Exception as e:
-            logger.exception("[AgentServer] session.create failed: %s", e)
+            logger.exception("[AgentServer] %s failed: %s", operation, e)
+            if not locals().get("external_tui_session", False):
+                await self._agent_manager.release_session_prewarm_claim(
+                    locals().get("session_id")
+                )
             resp = AgentResponse(
                 request_id=request.request_id,
                 channel_id=request.channel_id,
@@ -6835,6 +7878,13 @@ class AgentWebSocketServer:
             wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
             async with send_lock:
                 await send_wire_payload(ws, wire)
+        finally:
+            external_id_lock = locals().get("external_id_lock")
+            if (
+                external_id_lock is not None
+                and locals().get("external_id_lock_acquired", False)
+            ):
+                external_id_lock.release()
 
     async def _handle_session_fork(
             self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
@@ -6866,7 +7916,7 @@ class AgentWebSocketServer:
             if not source:
                 raise ValueError("source_session_id is required")
             if not target:
-                raise ValueError("target_session_id is required")
+                target = await self._agent_manager.create_session(channel_id=channel_id)
 
             # 1. Filesystem fork (copies history.json, writes metadata)
             result = fork_session(
@@ -6880,7 +7930,7 @@ class AgentWebSocketServer:
             agent = self._agent_manager.get_agent_nowait(channel_id)
             deep_agent = None
             if agent is not None:
-                deep_agent = agent.get_instance()
+                deep_agent = await agent.ensure_instance()
                 await copy_session_context(deep_agent, source, target)
             else:
                 logger.warning(
@@ -7083,7 +8133,7 @@ class AgentWebSocketServer:
             )
             agent_instance = None
             if agent is not None:
-                agent_instance = agent.get_instance()
+                agent_instance = await agent.ensure_instance()
                 logger.info(
                     "[AgentServer] harness.packages.activate: agent_instance type=%s, has_load_harness_config=%s",
                     type(agent_instance).__name__ if agent_instance else None,
@@ -7155,7 +8205,7 @@ class AgentWebSocketServer:
             )
             agent_instance = None
             if agent is not None:
-                agent_instance = agent.get_instance()
+                agent_instance = await agent.ensure_instance()
 
             service = AutoHarnessService(
                 rail=None,
@@ -7232,7 +8282,7 @@ class AgentWebSocketServer:
             )
             agent_instance = None
             if agent is not None:
-                agent_instance = agent.get_instance()
+                agent_instance = await agent.ensure_instance()
 
             service = AutoHarnessService(
                 rail=None,
@@ -7369,7 +8419,7 @@ class AgentWebSocketServer:
                 if agent is None:
                     raise ValueError("Failed to get agent for schedule request")
                 # Set agent on service (service will use it for execution)
-                self._scheduler_service.update_agent_instance(agent)
+                await self._scheduler_service.update_agent_instance(agent)
                 self._set_scheduler_agent(agent)
                 logger.info("[AgentServer] Set agent for schedule action %s: %s", action, agent is not None)
 

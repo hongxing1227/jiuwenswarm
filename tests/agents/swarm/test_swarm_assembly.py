@@ -52,6 +52,7 @@ from openjiuwen.core.single_agent.rail.base import (
 )
 from openjiuwen.harness.tools.worktree import WorktreeConfig
 from openjiuwen.harness.prompts.builder import SystemPromptBuilder
+from openjiuwen.harness.prompts.prompt_attachment_manager import PromptAttachmentManager
 from openjiuwen.harness.rails import SkillUseRail
 
 from jiuwenswarm.agents.swarm import (
@@ -280,7 +281,13 @@ def test_runtime_prompt_rail_resolves_via_registry() -> None:
 
 @pytest.mark.asyncio
 async def test_team_skill_storage_policy_rail_resolves_and_injects_paths(tmp_path: Path) -> None:
-    """The team skill storage policy should inject concrete team/member paths."""
+    """The team skill storage policy should inject concrete team-level paths.
+
+    Only team-level paths belong here: they are identical for every member, so
+    the team shares one cacheable prefix. The member's own workspace is
+    per-member and openjiuwen's team rail tells the member about it as part of
+    its identity, so this rail must not carry it in any lane.
+    """
     register_swarm_providers()
     global_skills_dir = str(tmp_path / "agent" / "workspace" / "skills")
     team_ws_root = str(tmp_path / ".agent_teams" / "unit" / "team-workspace")
@@ -301,16 +308,25 @@ async def test_team_skill_storage_policy_rail_resolves_and_injects_paths(tmp_pat
         context=fake_ctx,
     )
     builder = SystemPromptBuilder(language="cn")
-    rail.init(types.SimpleNamespace(system_prompt_builder=builder))
+    manager = PromptAttachmentManager()
+    rail.init(
+        types.SimpleNamespace(
+            system_prompt_builder=builder,
+            prompt_attachment_manager=manager,
+        )
+    )
 
-    await rail.before_model_call(AgentCallbackContext(agent=None, inputs=None, session=None))
+    session = types.SimpleNamespace(get_session_id=lambda: "sess-1")
+    await rail.before_model_call(AgentCallbackContext(agent=None, inputs=None, session=session))
 
     content = builder.build()
     assert f"{global_skills_dir}/<skill-name>/SKILL.md" in content
     assert team_ws_root in content
     assert team_skills_dir in content
-    assert member_workspace_root in content
     assert "skill-creator" not in content
+    # The per-member path is not this rail's business any more.
+    assert member_workspace_root not in content
+    assert await manager.list_by_filter(session_id="sess-1") == []
 
 
 @pytest.mark.asyncio
@@ -489,6 +505,30 @@ def test_swarm_skill_retrieval_tools_use_global_skill_manager(
 
     assert built == []
     assert calls == [None]
+
+
+def test_swarm_skill_retrieval_uses_context_team_skills_when_team_links_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    """HarmonyOS copied team mounts remain visible without symlink metadata."""
+    member_skills = tmp_path / "member-workspace" / "skills"
+    team_skills = tmp_path / "team-workspace" / "skills"
+    skill_dir = team_skills / "demo-skill"
+    member_skills.mkdir(parents=True)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo", encoding="utf-8")
+
+    workspace = SimpleNamespace(
+        get_node_path=lambda _node: member_skills,
+        list_team_links=lambda: [],
+    )
+    ctx = SwarmBuildContext(
+        mode="team",
+        workspace=workspace,
+        team_skills_dir=str(team_skills),
+    )
+
+    assert tools.visible_skill_names_for_list_skill(ctx) == {"demo-skill"}
 
 
 def test_swarm_skill_retrieval_prompt_uses_global_skill_manager(
@@ -730,8 +770,12 @@ def test_enrich_team_spec_for_swarm_rewrites_spec_in_place() -> None:
     assert not hasattr(spec, "agent_customizer")
 
 
-def test_enrich_team_spec_defaults_member_workspace_to_project_dir() -> None:
-    """Core receives project-rooted member workspaces from swarm enrichment."""
+def test_enrich_team_spec_points_member_cwd_at_project_dir() -> None:
+    """Core receives project-rooted member cwd, not a rewritten workspace.
+
+    cwd and workspace are separate layers: members run in the project
+    directory while keeping their own workspace for artifacts.
+    """
     spec = _make_team_spec()
     spec.worktree = WorktreeConfig(enabled=True)
 
@@ -743,8 +787,10 @@ def test_enrich_team_spec_defaults_member_workspace_to_project_dir() -> None:
         channel_id="web",
     )
 
-    assert spec.agents["leader"].workspace.root_path == "/tmp/project"
-    assert spec.agents["teammate"].workspace.root_path == "/tmp/project"
+    for role in ("leader", "teammate"):
+        assert spec.agents[role].cwd == "/tmp/project"
+        assert spec.agents[role].project_root == "/tmp/project"
+        assert spec.agents[role].workspace is None
 
 
 def test_enrich_team_spec_leaves_workspace_when_worktree_disabled() -> None:
@@ -761,10 +807,13 @@ def test_enrich_team_spec_leaves_workspace_when_worktree_disabled() -> None:
 
     assert spec.agents["leader"].workspace is None
     assert spec.agents["teammate"].workspace is None
+    # cwd is seeded regardless of worktree isolation.
+    assert spec.agents["leader"].cwd == "/tmp/project"
+    assert spec.agents["teammate"].cwd == "/tmp/project"
 
 
 def test_enrich_team_spec_preserves_explicit_member_workspace() -> None:
-    """A configured member workspace is not overwritten by project_dir."""
+    """A configured member workspace survives; only cwd is seeded."""
     spec = _make_team_spec()
     spec.worktree = WorktreeConfig(enabled=True)
     spec.agents["leader"].workspace = WorkspaceSpec(root_path="/tmp/custom")
@@ -778,7 +827,9 @@ def test_enrich_team_spec_preserves_explicit_member_workspace() -> None:
     )
 
     assert spec.agents["leader"].workspace.root_path == "/tmp/custom"
-    assert spec.agents["teammate"].workspace.root_path == "/tmp/project"
+    assert spec.agents["teammate"].workspace is None
+    assert spec.agents["leader"].cwd == "/tmp/project"
+    assert spec.agents["teammate"].cwd == "/tmp/project"
 
 
 def test_enrich_team_spec_appends_after_existing_rails(monkeypatch) -> None:
@@ -1704,6 +1755,16 @@ def test_team_plan_leader_structured_ask_user_provider_builds() -> None:
     ).__name__ == "StructuredAskUserRail"
 
 
+def test_non_interactive_team_omits_structured_ask_user_provider() -> None:
+    context = SwarmBuildContext(
+        mode="team",
+        role="leader",
+        request_metadata={"supports_user_interaction": False},
+    )
+
+    assert code_rails.build_structured_ask_user({}, context) is None
+
+
 def test_structured_ask_user_language_uses_team_leader_preferred_language() -> None:
     team_leader = SwarmBuildContext(
         mode="team",
@@ -1970,6 +2031,7 @@ def test_swarm_build_context_seed_round_trip() -> None:
         request_metadata={"mode": "code.team"},
         mode="code.team",
         project_dir="/tmp/proj",
+        disable_teammate_worktree=True,
         team_id="t1",
         team_ws_root="/tmp/ws",
         team_skills_dir="/tmp/ws/skills",
@@ -2000,6 +2062,7 @@ def test_swarm_build_context_seed_round_trip() -> None:
     assert restored.session_id == "s1"
     assert restored.mode == "code.team"
     assert restored.project_dir == "/tmp/proj"
+    assert restored.disable_teammate_worktree is True
     assert restored.team_id == "t1"
     assert restored.team_ws_root == "/tmp/ws"
     assert restored.request_metadata == {"mode": "code.team"}
@@ -2045,6 +2108,7 @@ def test_enrich_sets_serializable_build_context_seed() -> None:
     assert spec.build_context_seed is not None
     assert spec.build_context_seed["mode"] == "code.team"
     assert spec.build_context_seed["project_dir"] == "/tmp/proj"
+    assert spec.build_context_seed["disable_teammate_worktree"] is True
     assert spec.build_context_seed["team_id"] == spec.team_name
     # The seed equals what the live context exports.
     assert spec.build_context_seed == spec.build_context.to_seed()
